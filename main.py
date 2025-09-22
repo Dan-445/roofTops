@@ -197,7 +197,7 @@ async def extract_corners(file: UploadFile = File(...)):
 
 # Fixed async function to run FastAPI
 async def run_fastapi_async():
-    config = uvicorn.Config(app, host="0.0.0.0", port=8000)
+    config = uvicorn.Config(app, host="0.0.0.0", port=10000)
     server = uvicorn.Server(config)
     await server.serve()
 
