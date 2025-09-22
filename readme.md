@@ -13,6 +13,9 @@ AI-powered FastAPI service for detecting and extracting corner coordinates from 
    ```bash
    uvicorn main:app --reload
    ```
+   ```bash
+   uvicorn main:app --loop asyncio
+   ```
 
 3. **Access the API**
    - API: http://localhost:8000
