@@ -1,229 +1,193 @@
-import fastapi
-from fastapi import FastAPI, File, UploadFile, HTTPException
-import uvicorn
-import shutil
-import os
-import numpy as np
-import cv2
 from ultralytics import YOLO
-import matplotlib.pyplot as plt
-import threading
-import time
-import asyncio
-import nest_asyncio
+import cv2
+import numpy as np
+import math
+import json
+from fastapi import FastAPI, UploadFile, File, Form
+import tempfile
+import os
+import uvicorn
 
-# Apply nest_asyncio to allow running asyncio event loop in a thread
-nest_asyncio.apply()
-
-class RooftopCornerExtractor:
+class RoofEdgeDetector:
     def __init__(self, model_path):
         """
-        Initialize the rooftop corner extractor with YOLOv11 model
-
+        Initialize the roof edge detector with trained YOLO model
+        Following the recommended pipeline: AI returns pixels, we convert to lat/lng
+        
         Args:
-            model_path: Path to your YOLOv11 segmentation model
+            model_path (str): Path to your trained YOLO11 segmentation model
         """
         self.model = YOLO(model_path)
-
-    def extract_rooftop_corners(self, image_path, rooftop_class_id=None,
-                              corner_method='contour_approx', visualize=False):
+    
+    def get_roof_edge_pixels(self, image_path, confidence_threshold=0.5):
         """
-        Extract corner pixels from rooftop segmentation masks
-
+        Step 2: Send image to AI model and get roof edge pixels
+        AI model returns polylines/polygons as image pixels in native pixel grid (0,0 = top-left)
+        
         Args:
-            image_path: Path to input image
-            rooftop_class_id: Class ID for rooftop (None to auto-detect)
-            corner_method: 'harris', 'shi_tomasi', or 'contour_approx'
-            visualize: Whether to display results (not applicable in API context)
-
+            image_path (str): Path to the satellite image
+            confidence_threshold (float): Minimum confidence for detections
+            
         Returns:
-            Dictionary with corner coordinates for each rooftop
+            list: List of roof detections with pixel coordinates only
         """
-        # Load and process image
+        # Run inference on the image
+        results = self.model(image_path)
+        
+        roof_detections = []
+        
+        for result in results:
+            if result.masks is not None:
+                boxes = result.boxes
+                masks = result.masks.data.cpu().numpy()
+                
+                for i, (box, mask) in enumerate(zip(boxes.data, masks)):
+                    confidence = float(box[4])
+                    
+                    if confidence >= confidence_threshold:
+                        # Extract edge points from mask (pixel coordinates only)
+                        edge_pixels = self._extract_roof_edges_from_mask(mask)
+                        
+                        if len(edge_pixels) >= 3:  # Valid polygon
+                            roof_detection = {
+                                'roof_id': i,
+                                'confidence': confidence,
+                                'bbox_pixels': box[:4].tolist(),  # [x1, y1, x2, y2]
+                                'edge_pixels': edge_pixels,  # [[x, y], [x, y], ...] in image coordinates
+                                'num_edges': len(edge_pixels)
+                            }
+                            roof_detections.append(roof_detection)
+        
+        return roof_detections
+    
+    def _extract_roof_edges_from_mask(self, mask, epsilon_factor=0.015):
+        """
+        Extract roof edge points from segmentation mask
+        Returns pixel coordinates in image's native grid (0,0 = top-left)
+        
+        Args:
+            mask (numpy.ndarray): Binary mask of the roof
+            epsilon_factor (float): Douglas-Peucker approximation factor
+            
+        Returns:
+            list: Edge points as [[x, y], [x, y], ...] in pixel coordinates
+        """
+        # Find contours
+        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return []
+        
+        # Get the largest contour (main roof)
+        largest_contour = max(contours, key=cv2.contourArea)
+        
+        # Use Douglas-Peucker algorithm to get key edge points
+        epsilon = epsilon_factor * cv2.arcLength(largest_contour, True)
+        approx_contour = cv2.approxPolyDP(largest_contour, epsilon, True)
+        
+        # Convert to list of [x, y] coordinates (pixel coordinates)
+        edge_pixels = []
+        for point in approx_contour:
+            x, y = point[0]
+            edge_pixels.append([int(x), int(y)])
+        
+        return edge_pixels
+    
+    def process_static_map_image(self, image_path, confidence_threshold=0.5):
+        """
+        Complete pipeline following the recommended approach:
+        1. We have static map with known metadata (center, zoom, size, scale)
+        2. Send image to AI model → get roof edges as pixel coordinates
+        3. Convert pixels to lat/lng using Web Mercator formulas
+        
+        Args:
+            image_path (str): Path to the static map image
+            center_lat (float): Center latitude from static map request
+            center_lng (float): Center longitude from static map request
+            zoom (int): Zoom level from static map request
+            img_width (int): Image width from static map request
+            img_height (int): Image height from static map request
+            scale (int): Scale factor from static map request
+            confidence_threshold (float): Minimum confidence for detections
+            
+        Returns:
+            dict: Complete results with both pixel and lat/lng coordinates
+        """
+        
+        print("Step 2: Sending to AI model...")
+        # Get roof edge pixels from AI model
+        roof_pixels = self.get_roof_edge_pixels(image_path, confidence_threshold)
+        print(f"  AI model found {len(roof_pixels)} roofs with edge pixels")
+        
+        
+        return {
+            'image_path': image_path,
+            'roofs': roof_pixels,
+            'total_roofs': len(roof_pixels),
+            'pipeline_followed': "AI returns pixels"
+        }
+    
+    def visualize_results(self, image_path, results, output_path=None):
+        """
+        Visualize the detected roof edges with pixel coordinates
+        """
         image = cv2.imread(image_path)
         if image is None:
-            raise ValueError(f"Could not load image: {image_path}")
-
-        # Run YOLOv11 segmentation
-        results = self.model(image)
-
-        rooftop_corners = {}
-
-        for idx, result in enumerate(results):
-            if result.masks is None:
-                print("No segmentation masks found")
-                continue
-
-            masks = result.masks.data.cpu().numpy()
-            boxes = result.boxes.data.cpu().numpy()
-
-            for i, mask in enumerate(masks):
-                # Get class ID
-                class_id = int(boxes[i][5])
-
-                # Filter for rooftop class if specified
-                if rooftop_class_id is not None and class_id != rooftop_class_id:
-                    continue
-
-                # Resize mask to image dimensions
-                mask_resized = cv2.resize(mask, (image.shape[1], image.shape[0]))
-                mask_binary = (mask_resized > 0.5).astype(np.uint8) * 255
-
-                # Extract corners based on method
-                corners = self._extract_corners(mask_binary, method=corner_method)
-
-                rooftop_corners[f"rooftop_{i}"] = {
-                    'corners': corners,
-                    'class_id': class_id,
-                    'mask': mask_binary # Mask is not typically returned in API response
-                }
-
-        # Visualization is skipped in the API context
-        # if visualize:
-        #     self._visualize_results(image, rooftop_corners)
-
-        return rooftop_corners
-
-    def _extract_corners(self, mask, method='harris'):
-        """
-        Extract corners from binary mask using specified method
-        """
-        if method == 'harris':
-            return self._harris_corners(mask)
-        elif method == 'shi_tomasi':
-            return self._shi_tomasi_corners(mask)
-        elif method == 'contour_approx':
-            return self._contour_approximation_corners(mask)
-        else:
-            raise ValueError(f"Unknown method: {method}")
-
-    def _harris_corners(self, mask):
-        """Extract corners using Harris corner detection"""
-        # Convert to float32
-        mask_float = np.float32(mask)
-
-        # Harris corner detection
-        corners = cv2.cornerHarris(mask_float, 2, 3, 0.04)
-
-        # Threshold and find corner coordinates
-        corners = cv2.dilate(corners, None)
-        corner_coords = np.where(corners > 0.01 * corners.max())
-
-        return list(zip(corner_coords[1], corner_coords[0]))  # (x, y) format
-
-    def _shi_tomasi_corners(self, mask):
-        """Extract corners using Shi-Tomasi corner detection"""
-        corners = cv2.goodFeaturesToTrack(
-            mask,
-            maxCorners=20,
-            qualityLevel=0.01,
-            minDistance=10,
-            blockSize=3
-        )
-
-        if corners is not None:
-            return [(int(x), int(y)) for [[x, y]] in corners]
-        return []
-
-    def _contour_approximation_corners(self, mask):
-        """Extract corners using contour approximation"""
-        # Find contours
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        all_corners = []
-        for contour in contours:
-            # Approximate contour to polygon
-            epsilon = 0.001 * cv2.arcLength(contour, True) # Epsilon value from last successful run
-            approx = cv2.approxPolyDP(contour, epsilon, True)
-
-            # Extract corner points
-            corners = [(point[0][0], point[0][1]) for point in approx]
-            all_corners.extend(corners)
-
-        return all_corners
-
-    # Visualization method is not included in the API script
-    # def _visualize_results(self, image, rooftop_corners):
-    #     """Visualize the extracted corners on the image"""
-    #     fig, axes = plt.subplots(1, 2, figsize=(15, 7))
-    #     # ... visualization code ...
-    #     plt.show()
-
-    # Save method is not included in the API script
-    # def save_corner_coordinates(self, rooftop_corners, output_file):
-    #     """Save corner coordinates to file"""
-    #     # ... save code ...
-    #     pass
-
+            print(f"Could not load image: {image_path}")
+            return None
+            
+        colors = [(0, 255, 0), (255, 0, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255)]
+        
+        for i, roof in enumerate(results['roofs']):
+            color = colors[i % len(colors)]
+            edge_pixels = roof['edge_pixels']
+            
+            # Draw edge points
+            for j, (x, y) in enumerate(edge_pixels):
+                cv2.circle(image, (x, y), 6, color, -1)
+                cv2.putText(image, str(j+1), (x+8, y-8), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            
+            # Draw polygon connecting edge points
+            if len(edge_pixels) > 2:
+                pts = np.array(edge_pixels, np.int32)
+                cv2.polylines(image, [pts], True, color, 3)
+            
+            # Add roof info
+            if edge_pixels:
+                text = f"Roof {roof['roof_id']}: {roof['confidence']:.3f} ({roof['num_edges']} edges)"
+                cv2.putText(image, text, (edge_pixels[0][0], edge_pixels[0][1]-15), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        
+        if output_path:
+            cv2.imwrite(output_path, image)
+            print(f"Visualization saved to: {output_path}")
+        
+        return image
+    
 
 app = FastAPI()
 
-# Initialize the extractor globally
-# Update this path to your trained model file
-model_path = 'best.pt'
-extractor = RooftopCornerExtractor(model_path)
+detector = RoofEdgeDetector("seg-best.pt")
 
+@app.post("/process")
+async def process_roof(
+    image: UploadFile = File(...),
+    confidence_threshold: float = Form(0.5)
+):
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpeg") as tmp:
+        contents = await image.read()
+        tmp.write(contents)
+        image_path = tmp.name
 
-@app.post("/extract_corners/")
-async def extract_corners(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(('.png', '.jpg', '.jpeg')):
-        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a PNG, JPG, or JPEG image.")
-
-    # Create a temporary file to save the uploaded image
-    temp_file_path = f"temp_{file.filename}"
     try:
-        with open(temp_file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-
-        # Integrate the RooftopCornerExtractor here
-        corners_data = extractor.extract_rooftop_corners(image_path=temp_file_path, visualize=False)
-
-        # Format the corners_data into the desired JSON structure
-        formatted_corners = {}
-        for roof_id, data in corners_data.items():
-             formatted_corners[roof_id] = {
-                 "class_id": data["class_id"],
-                 "corners": [[int(c[0]), int(c[1])] for c in data["corners"]] # Ensure corners are list of integers
-             }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing image: {e}")
+        results = detector.process_static_map_image(
+            image_path, confidence_threshold
+        )
+        detector.visualize_results(image_path, results, "roof_edges_visualization.jpg")
+        return results
     finally:
-        # Clean up temp file
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-
-    return formatted_corners
-
-
-# Fixed async function to run FastAPI
-async def run_fastapi_async():
-    config = uvicorn.Config(app, host="0.0.0.0", port=10000)
-    server = uvicorn.Server(config)
-    await server.serve()
-
-
-def run_fastapi():
-    """Run FastAPI server in a thread with proper asyncio event loop"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(run_fastapi_async())
-
+        os.unlink(image_path)
 
 if __name__ == "__main__":
-    print("Starting FastAPI app...")
-    # Run FastAPI in a separate thread
-    thread = threading.Thread(target=run_fastapi)
-    thread.daemon = True  # Make thread daemon so it exits when main thread exits
-    thread.start()
-
-    print("FastAPI app is running. You can access it at:")
-    print("http://localhost:8000/docs for the OpenAPI documentation.")
-    print("http://localhost:8000/extract_corners/ to test the endpoint.")
-
-    # Keep the main thread alive to prevent the script from exiting
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("FastAPI app stopped.")
-        pass
+    uvicorn.run(app, host="127.0.0.1", port=8000)
