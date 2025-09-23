@@ -4,6 +4,7 @@ import numpy as np
 import math
 import json
 from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.staticfiles import StaticFiles
 import tempfile
 import os
 import uvicorn
@@ -124,7 +125,8 @@ class RoofEdgeDetector:
             'image_path': image_path,
             'roofs': roof_pixels,
             'total_roofs': len(roof_pixels),
-            'pipeline_followed': "AI returns pixels"
+            'pipeline_followed': "AI returns pixels",
+            'visualization_url': '/static/roof_edges_visualization.jpg'
         }
     
     def visualize_results(self, image_path, results, output_path=None):
@@ -169,6 +171,8 @@ class RoofEdgeDetector:
 app = FastAPI()
 
 detector = RoofEdgeDetector("seg-best.pt")
+
+app.mount("/static", StaticFiles(directory="."), name="static")
 
 @app.post("/process")
 async def process_roof(
