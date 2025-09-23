@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>YOLO Roof Segmentation Test</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 20px; }
+        #output { background: #f0f0f0; padding: 10px; white-space: pre-wrap; font-family: monospace; }
+        .success { color: green; font-weight: bold; }
+        .error { color: red; font-weight: bold; }
+        img { border: 1px solid #ccc; margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <h2>YOLO Roof Segmentation Model Test</h2>
+    <p>Use staticmap.png or another rooftop image:</p>
+    <input type="file" id="imageUpload" accept="image/*">
+    <br><br>
+    <img id="testImage" style="max-width: 500px; display: none;">
+    <div id="output"></div>
+    
+    <script>
+        const output = document.getElementById('output');
+        
+        function log(message, className = '') {
+            const line = document.createElement('div');
+            line.textContent = message;
+            if (className) line.className = className;
+            output.appendChild(line);
+            console.log(message);
+        }
+        
+        function clear() {
+            output.innerHTML = '';
+        }
+        
+        document.getElementById('imageUpload').onchange = async (e) => {
+            const file = e.target.files[0];
+            const img = document.getElementById('testImage');
+            img.src = URL.createObjectURL(file);
+            img.style.display = 'block';
+            
+            img.onload = async () => {
+                clear();
+                log(`Image loaded: ${file.name} (${img.width}x${img.height})`);
+                log('=' .repeat(50));
+                
+                try {
+                    // Load model
+                    log('Loading TFJS model...');
+                    const modelUrl = './best_web_model/model.json';
+                    const model = await tf.loadGraphModel(modelUrl);
+                    log('✓ Model loaded successfully', 'success');
+                    
+                    // Show model info
+                    log('\nModel Information:');
+                    log(`Inputs: ${model.inputs.length} tensor(s)`);
+                    model.inputs.forEach((input, i) => {
+                        log(`  Input ${i}: shape=${JSON.stringify(input.shape)}, dtype=${input.dtype}`);
+                    });
+                    
+                    log(`Outputs: ${model.outputs.length} tensor(s)`);
+                    model.outputs.forEach((output, i) => {
+                        log(`  Output ${i}: shape=${JSON.stringify(output.shape)}, dtype=${output.dtype}`);
+                    });
+                    
+                    // Prepare input
+                    log('\nPreparing input...');
+                    const inputTensor = tf.tidy(() => {
+                        return tf.browser.fromPixels(img)
+                            .resizeBilinear([640, 640])
+                            .div(255.0)
+                            .expandDims(0);
+                    });
+                    log(`Input tensor shape: ${inputTensor.shape}`);
+                    
+                    // Run inference
+                    log('\nRunning inference...');
+                    const startTime = performance.now();
+                    const outputs = await model.executeAsync(inputTensor);
+                    const inferenceTime = performance.now() - startTime;
+                    log(`✓ Inference completed in ${inferenceTime.toFixed(1)}ms`, 'success');
+                    
+                    // Process outputs
+                    const outputArray = Array.isArray(outputs) ? outputs : [outputs];
+                    log(`\nModel returned ${outputArray.length} output tensor(s)`);
+                    
+                    // Analyze detection output (first tensor)
+                    if (outputArray.length >= 1) {
+                        log('\n--- Detection Output Analysis ---');
+                        const detOutput = outputArray[0];
+                        log(`Shape: ${detOutput.shape}`);
+                        
+                        const detData = await detOutput.array();
+                        
+                        // Handle different shapes
+                        let predictions;
+                        if (detOutput.shape.length === 3) {
+                            predictions = detData[0]; // Remove batch dimension
+                            log(`Batch dimension removed, analyzing ${predictions.length} predictions`);
+                        } else {
+                            predictions = detData;
+                            log(`Analyzing ${predictions.length} predictions`);
+                        }
+                        
+                        if (predictions.length > 0) {
+                            const numFeatures = predictions[0].length;
+                            log(`Features per prediction: ${numFeatures}`);
+                            
+                            // Expected format: [x, y, w, h, conf, class?, ...mask_coeffs]
+                            // For single class: [x, y, w, h, conf, ...mask_coeffs]
+                            
+                            // Find detections with good confidence
+                            let detectedRoofs = 0;
+                            for (let i = 0; i < Math.min(predictions.length, 100); i++) {
+                                const pred = predictions[i];
+                                const conf = pred[4]; // Confidence at index 4
+                                
+                                if (conf > 0.25) {
+                                    detectedRoofs++;
+                                    log(`\n  Detection ${detectedRoofs}:`);
+                                    log(`    Center: (${pred[0].toFixed(1)}, ${pred[1].toFixed(1)})`);
+                                    log(`    Size: ${pred[2].toFixed(1)} x ${pred[3].toFixed(1)}`);
+                                    log(`    Confidence: ${conf.toFixed(3)}`);
+                                    
+                                    // Check for mask coefficients
+                                    const maskCoeffsStart = 5; // After [x,y,w,h,conf]
+                                    if (numFeatures > maskCoeffsStart) {
+                                        const numMaskCoeffs = numFeatures - maskCoeffsStart;
+                                        log(`    Mask coefficients: ${numMaskCoeffs} values`);
+                                        
+                                        // Show first few mask coefficients
+                                        const coeffsSample = pred.slice(maskCoeffsStart, maskCoeffsStart + 5);
+                                        log(`    First 5 coeffs: [${coeffsSample.map(c => c.toFixed(3)).join(', ')}]`);
+                                    }
+                                }
+                            }
+                            
+                            if (detectedRoofs > 0) {
+                                log(`\n✓ Found ${detectedRoofs} roof(s)!`, 'success');
+                            } else {
+                                log('\n⚠ No roofs detected (confidence > 0.25)', 'error');
+                                
+                                // Check if there are low-confidence detections
+                                const lowConf = predictions.filter(p => p[4] > 0.01 && p[4] <= 0.25);
+                                if (lowConf.length > 0) {
+                                    log(`  Found ${lowConf.length} low-confidence detections (0.01 < conf < 0.25)`);
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Analyze mask prototypes (second tensor, if exists)
+                    if (outputArray.length >= 2) {
+                        log('\n--- Mask Prototype Output ---');
+                        const maskOutput = outputArray[1];
+                        log(`Shape: ${maskOutput.shape}`);
+                        
+                        if (maskOutput.shape.length === 4) {
+                            const [batch, numProtos, height, width] = maskOutput.shape;
+                            log(`Mask prototypes: ${numProtos} masks of size ${height}x${width}`);
+                        } else if (maskOutput.shape.length === 3) {
+                            const [numProtos, height, width] = maskOutput.shape;
+                            log(`Mask prototypes: ${numProtos} masks of size ${height}x${width}`);
+                        }
+                    }
+                    
+                    // Clean up
+                    inputTensor.dispose();
+                    outputArray.forEach(t => t.dispose());
+                    
+                    log('\n' + '=' .repeat(50));
+                    log('Test complete! Check if detections match Python output.', 'success');
+                    
+                } catch (error) {
+                    log(`\nERROR: ${error.message}`, 'error');
+                    console.error(error);
+                    log('\nPossible issues:');
+                    log('1. Model files not found - check best_web_model/ directory');
+                    log('2. CORS issues - serve files via HTTP server, not file://');
+                    log('3. Export failed - re-run the Python export script');
+                }
+            };
+        };
+    </script>
+</body>
+</html>
