@@ -8,9 +8,15 @@ import matplotlib.pyplot as plt
 import tempfile
 import os
 from typing import List, Dict
-
+from fastapi.middleware.cors import CORSMiddleware  # Import CORS middleware
 app = FastAPI(title="Rooftop Segmentation API")
-
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins; for production, specify trusted domains (e.g., ["https://your-frontend.com"])
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
+    allow_headers=["*"],  # Allows all headers
+)
 # Set device to CUDA
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
