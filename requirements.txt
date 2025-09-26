@@ -1,8 +1,9 @@
 fastapi
-uvicorn
-ultralytics
-opencv-python-headless
+uvicorn[standard]
+python-multipart
+opencv-python
 numpy
-nest_asyncio
-matplotlib
 torch
+torchvision
+ultralytics
+matplotlib
