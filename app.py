@@ -21,7 +21,7 @@ app.add_middleware(
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 # 1. Load pretrained YOLO model
-yolo_model = YOLO("updated-roof-segment.pt")
+yolo_model = YOLO("updated-seg-v2.pt")
 
 @app.post("/segment-rooftop/")
 async def segment_rooftop(file: UploadFile = File(...)):
